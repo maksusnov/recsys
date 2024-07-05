@@ -1,0 +1,57 @@
+def transfer_orders():
+    dwh_engine, mssql_session = get_mssql_connection()
+    pg_conn, pg_cursor = get_postgres_connection()
+
+    try:
+        orders_data = mssql_session.execute("""
+            SELECT
+                Consultant_id,
+                Order_id,
+                OrderDate,
+                OrderType_id,
+                Goods_id
+            FROM
+                dwh.OrderItem
+            WHERE
+                OrderDate >= CAST(GETDATE() - 1 AS DATE) AND
+                OrderDate < CAST(GETDATE() AS DATE);
+        """).fetchall()
+
+        pg_cursor.executemany("""
+            INSERT INTO orders (consultant_id, order_id, order_date, order_type_id, goods_id)
+            VALUES (%s, %s, %s, %s, %s);
+        """, orders_data)
+
+        pg_conn.commit()
+    finally:
+        mssql_session.close()
+        dwh_engine.dispose()
+        pg_cursor.close()
+        pg_conn.close()
+
+
+def prepare_orders():
+    engine = get_sqlalchemy_engine()
+    with engine.connect() as conn:
+        try:
+            orders = pd.read_sql_query("""
+                SELECT *
+                FROM orders
+                WHERE
+                order_date >= CURRENT_DATE - INTERVAL '1 day' AND
+                order_date < CURRENT_DATE;
+            """, conn)
+
+            goods = pd.read_sql_table("goods_prepared", conn)
+
+            orders_prepared = pd.merge(orders, goods, on='goods_id')
+
+            orders_prepared = orders_prepared.dropna()
+
+            weights = orders_prepared.groupby(['consultant_id', 'goods_id']).size().reset_index(name='weight')
+            orders_prepared = pd.merge(orders_prepared, weights, on=['consultant_id', 'goods_id'], how='left')
+
+            column_to_drop = ['goods_marketing_name', 'goods_article', 'goods_category_id', 'source_row_id']
+            orders_prepared = orders_prepared.drop(columns=column_to_drop)
+
+            orders_prepared.to_sql('orders_prepared', conn, if_exists='append', index=False)
