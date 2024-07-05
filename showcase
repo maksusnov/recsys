@@ -1,0 +1,27 @@
+def merge_recommendations():
+    engine = get_sqlalchemy_engine()
+    with engine.connect() as conn:
+        try:
+            conn.execute("TRUNCATE TABLE final_rec;")
+
+            personal_rec = pd.read_sql_query("SELECT user_id AS consultant_id, item_id AS goods_id FROM personal_rec;",
+                                             conn)
+            personal_rec['feature'] = 'personal'
+
+            popular_rec = pd.read_sql_query("SELECT consultant_id, item_id AS goods_id FROM popular_in_category;", conn)
+            popular_rec['feature'] = 'popular'
+
+            goods = pd.read_sql_query("SELECT goods_id, source_row_id FROM goods_prepared;", conn)
+            consultant = pd.read_sql_query("SELECT consultant_id, source_row_id FROM consultant;", conn)
+
+            personal_rec = personal_rec.merge(goods, left_on='goods_id', right_on='goods_id', how='left').drop(columns=['goods_id']).rename(columns={'source_row_id': 'goods_id'})
+            personal_rec = personal_rec.merge(consultant, left_on='consultant_id', right_on='consultant_id', how='left').drop(columns=['consultant_id']).rename(columns={'source_row_id': 'consultant_id'})
+
+            popular_rec = popular_rec.merge(goods, left_on='goods_id', right_on='goods_id', how='left').drop(columns=['goods_id']).rename(columns={'source_row_id': 'goods_id'})
+            popular_rec = popular_rec.merge(consultant, left_on='consultant_id', right_on='consultant_id', how='left').drop(columns=['consultant_id']).rename(columns={'source_row_id': 'consultant_id'})
+
+            final_rec = pd.concat([personal_rec, popular_rec]).sort_values(by=['consultant_id', 'feature'], ascending=[True, False])
+
+            final_rec['rank'] = final_rec.groupby(['consultant_id', 'feature']).cumcount() + 1 
+
+            final_rec.to_sql('final_rec', conn, if_exists='append', index=False)
