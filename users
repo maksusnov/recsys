@@ -1,0 +1,142 @@
+def transfer_consultant():
+    dwh_engine, mssql_session = get_mssql_connection()
+    pg_conn, pg_cursor = get_postgres_connection()
+
+    try:
+        consultant_data = mssql_session.execute("""
+            SELECT
+                Consultant_id,
+                Gender,
+                BirthDate,
+                GeoZone_id,
+                SourceRowLastUpdated,
+                SourceRow_id
+            FROM
+                dwh.Consultant
+            WHERE
+            SourceRowLastUpdated >= CAST(GETDATE() - 1 AS DATE) AND
+            SourceRowLastUpdated < CAST(GETDATE() AS DATE);
+        """).fetchall()
+
+        pg_cursor.executemany("""
+            INSERT INTO consultant (consultant_id, gender, birthdate, geozone_id, source_row_last_updated, source_row_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (consultant_id) DO UPDATE
+            SET gender = EXCLUDED.gender, 
+                birthdate = EXCLUDED.birthdate, 
+                geozone_id = EXCLUDED.geozone_id, 
+                source_row_last_updated = EXCLUDED.source_row_last_updated,
+                source_row_id = EXCLUDED.source_row_id
+        """, consultant_data)
+
+        consultant_period_data = mssql_session.execute("""
+               SELECT
+                   Consultant_id,
+                   CalculationPeriodStartDate,
+                   CalculationPeriod_id,
+                   SelfScore,
+                   SourceRowLastUpdated
+               FROM
+                   dwh.MLMConsultant
+               WHERE
+               SourceRowLastUpdated >= CAST(GETDATE() - 1 AS DATE) AND
+               SourceRowLastUpdated < CAST(GETDATE() AS DATE);
+           """).fetchall()
+
+        pg_cursor.executemany("""
+               INSERT INTO consultant_period (consultant_id, calculation_period_start_date, calculation_period_id, selfscore, source_row_last_updated)
+               VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (consultant_id, calculation_period_id) DO UPDATE
+               SET calculation_period_start_date = EXCLUDED.calculation_period_start_date,  
+                   selfscore = EXCLUDED.selfscore, 
+                   source_row_last_updated = EXCLUDED.source_row_last_updated;
+           """, consultant_period_data)
+
+        pg_conn.commit()
+    finally:
+        mssql_session.close()
+        dwh_engine.dispose()
+        pg_cursor.close()
+        pg_conn.close()
+
+
+def prepare_consultant():
+    engine = get_sqlalchemy_engine()
+    with engine.connect() as conn:
+        try:
+            consultant = pd.read_sql_query("""
+                SELECT *
+                FROM consultant
+                WHERE source_row_last_updated >= CURRENT_DATE - INTERVAL '1 DAY'
+                AND source_row_last_updated < CURRENT_DATE;
+            """, conn)
+
+            consultant_period = pd.read_sql_query("""
+                SELECT *
+                FROM consultant_period
+                WHERE source_row_last_updated >= CURRENT_DATE - INTERVAL '1 DAY'
+                AND source_row_last_updated < CURRENT_DATE;
+            """, conn)
+
+            column_to_drop = ['source_row_last_updated', 'source_row_id']
+            consultant = consultant.drop(columns=column_to_drop)
+            column_to_drop = ['source_row_last_updated']
+            consultant_period = consultant_period.drop(columns=column_to_drop)
+
+            consultant = pd.merge(consultant, consultant_period, on='consultant_id', how='left')
+
+            consultant['birthdate'] = pd.to_datetime(consultant['birthdate'], errors='coerce')
+            consultant.loc[consultant['birthdate'] < '1900-01-01', 'birthdate'] = '1900-01-01'
+
+            consultant['gender'].fillna('o', inplace=True)
+            consultant['birthdate'].fillna(pd.to_datetime('1900-01-01'), inplace=True)
+            consultant['geozone_id'].fillna(0, inplace=True)
+            consultant['selfscore'].fillna(0, inplace=True)
+
+            current_date = pd.to_datetime('today')
+            consultant['age'] = current_date.year - consultant['birthdate'].dt.year - (
+                (current_date.month < consultant['birthdate'].dt.month) |
+                ((current_date.month == consultant['birthdate'].dt.month) & (
+                    current_date.day < consultant['birthdate'].dt.day))
+            ).astype(int)
+
+            consultant_prepared = consultant
+
+            bins = [0, 20, 30, 40, 50, 99, float('inf')]
+            labels = [1, 2, 3, 4, 5, 6]
+            consultant_prepared['age_id'] = pd.cut(consultant_prepared['age'], bins=bins, labels=labels, right=False).astype(float)
+
+            bins = [0, 0.01, 50, 100, float('inf')]
+            labels = [0, 1, 2, 3]
+            consultant_prepared['selfscore_id'] = pd.cut(consultant_prepared['selfscore'], bins=bins, labels=labels, right=False).astype(float)
+
+            # Заполнение NaN значений перед преобразованием типов
+            consultant_prepared['age_id'].fillna(0, inplace=True)
+            consultant_prepared['selfscore_id'].fillna(0, inplace=True)
+
+            # Проверка наличия NaN значений
+            if consultant_prepared[['age_id', 'selfscore_id']].isnull().any().any():
+                raise ValueError("Data contains NaN values after filling NaNs.")
+
+            columns_to_drop = ['birthdate', 'calculation_period_start_date', 'calculation_period_id', 'selfscore', 'age']
+            consultant_prepared = consultant_prepared.drop(columns=columns_to_drop)
+
+            consultant_prepared['consultant_id'] = consultant_prepared['consultant_id'].astype(int)
+            consultant_prepared['gender'] = consultant_prepared['gender'].astype(str)
+            consultant_prepared['age_id'] = consultant_prepared['age_id'].astype(int)
+            consultant_prepared['geozone_id'] = consultant_prepared['geozone_id'].astype(float)
+            consultant_prepared['selfscore_id'] = consultant_prepared['selfscore_id'].astype(int)
+
+            data_dicts = [dict(zip(['consultant_id', 'gender', 'geozone_id', 'age_id', 'selfscore_id'], row)) for row in consultant_prepared.to_numpy()]
+
+            sql = """
+                INSERT INTO consultant_prepared (consultant_id, gender, geozone_id, age_id, selfscore_id)
+                VALUES (%(consultant_id)s, %(gender)s, %(geozone_id)s, %(age_id)s, %(selfscore_id)s)
+                ON CONFLICT (consultant_id) DO UPDATE SET
+                    gender = EXCLUDED.gender,
+                    geozone_id = EXCLUDED.geozone_id,
+                    age_id = EXCLUDED.age_id,
+                    selfscore_id = EXCLUDED.selfscore_id
+                """
+
+            conn.execute(sql, data_dicts)
