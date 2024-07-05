@@ -1,0 +1,100 @@
+def transfer_goods():
+    dwh_engine, mssql_session = get_mssql_connection()
+    pg_conn, pg_cursor = get_postgres_connection()
+
+    try:
+        pg_cursor.execute("TRUNCATE TABLE goods RESTART IDENTITY;")
+        pg_cursor.execute("TRUNCATE TABLE goods_category RESTART IDENTITY;")
+        pg_cursor.execute("TRUNCATE TABLE geo_zone RESTART IDENTITY;")
+
+        goods_data = mssql_session.execute("""
+            SELECT
+                Goods_id,
+                GoodsMarketingName,
+                GoodsArticle,
+                GoodsCategory_id,
+                SourceRow_id
+            FROM
+                dwh.Goods;
+        """).fetchall()
+
+        pg_cursor.executemany("""
+            INSERT INTO goods (goods_id, goods_marketing_name, goods_article,goods_category_id, source_row_id)
+            VALUES (%s, %s, %s, %s, %s);
+        """, goods_data)
+
+        category_data = mssql_session.execute("""
+                SELECT
+                    GoodsCategory_id,
+                    GoodsCategory
+                FROM
+                    dwh.GoodsCategory;
+            """).fetchall()
+
+        pg_cursor.executemany("""
+                INSERT INTO goods_category (goods_category_id, goods_category)
+                VALUES (%s, %s);
+            """, category_data)
+
+        geozone_data = mssql_session.execute("""
+                    SELECT
+                        GeoZone_id,
+                        GeoZone,
+                        ParentGeoZone_id,
+                        ParentGeoZoneName
+                    FROM
+                        dwh.GeoZone;
+                """).fetchall()
+
+        pg_cursor.executemany("""
+                    INSERT INTO geo_zone (geozone_id, geo_zone, parent_geo_zone_id, parent_geo_zone_name)
+                    VALUES (%s, %s, %s, %s);
+                """, geozone_data)
+
+        pg_conn.commit()
+    finally:
+        mssql_session.close()
+        dwh_engine.dispose()
+        pg_cursor.close()
+        pg_conn.close()
+    log_end('transfer_goods')
+
+
+def prepare_goods():
+    engine = get_sqlalchemy_engine()
+    with engine.connect() as conn:
+        try:
+            conn.execute("TRUNCATE TABLE goods_prepared;")
+
+            goods = pd.read_sql_table("goods", conn)
+            goods_category = pd.read_sql_table("goods_category", conn)
+            goods_prepared = pd.merge(goods, goods_category, on='goods_category_id', how='left')
+            goods_prepared = goods_prepared.dropna(subset=['goods_marketing_name'])
+            goods_prepared = goods_prepared.astype({'goods_marketing_name': 'str', 'goods_category': 'str'})
+            words_to_exclude = ['пакет', 'каталог', 'купон', 'пробник', 'тестер', 'сопутствующ',
+                                'раздаточн', 'МаркетПлейс', 'Бюстгальтеры', 'Florange', 'Лифы',
+                                'Корректирующее бельё', 'Плавки', 'Бельё', 'Трусы', 'Бижутерия',
+                                'Купальник сплошной', 'Элементы стиля', 'Домашняя одежда',
+                                'Боди, неглиже', 'Колготки Florange', 'Футболки, поло', 'Легинсы',
+                                'Водолазки', 'Бизнес-аксессуары консультанта', 'Колготки', 'Обувь',
+                                'Носки', 'Платья', 'Блузки', 'Юбки', 'Лонгсливы', 'Брюки', 'Куртки',
+                                'Свитеры, джемперы, кардиганы', 'Джемперы, кардиганы', 'Толстовки',
+                                'Жакеты, жилеты', 'Джинсы', 'Майки, футболки', 'Топы', 'Футболки, Топы',
+                                'Шорты', 'Платья, Сарафаны', 'Шорты, Капри', 'Детская одежда и обувь',
+                                'Футболки, Поло', 'Блузки, Рубашки', 'Пальто, Пуховики', 'Куртки, Ветровки',
+                                'Рубашки, Блейзеры', 'Жилет', 'Пальто, пуховики', 'Жакет', 'Леггинсы', 'Блейзер',
+                                'Поло', 'Костюмы', 'Комбинезоны', 'Рубашки', 'Обучающие материалы', 'Куртки, ветровки',
+                                'Пиджаки, жилеты', 'Товары для демонстрации продукции', 'Билеты на тренинги',
+                                'Детская обувь', 'Купальники', 'Нижнее белье', 'Обувь для мальчиков', 'Детские колготки',
+                                'Обувь унисекс', 'Пляжные платья', 'Головные уборы', 'Коррекция фигуры', 'Параметры СМК',
+                                'Печатная и вспомогательная продукция', 'SMS-рассылки', 'Буклеты Sengara',
+                                'Колготки, нижнее белье, купальники']
+            mask = goods_prepared['goods_marketing_name'].str.contains('|'.join(words_to_exclude), case=False) | \
+                   goods_prepared['goods_category'].str.contains('|'.join(words_to_exclude), case=False)
+            goods_prepared = goods_prepared[~mask]
+            goods_prepared = goods_prepared.replace('nan', pd.NA)
+            goods_prepared = goods_prepared.replace('NaN', pd.NA)
+            goods_prepared = goods_prepared.dropna()
+            column_to_drop = ['goods_category']
+            goods_prepared = goods_prepared.drop(columns=column_to_drop)
+            goods_prepared.to_sql('goods_prepared', conn, if_exists='append', index=False)
