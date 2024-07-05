@@ -1,0 +1,57 @@
+def popular_model():
+    engine = get_sqlalchemy_engine()
+    with engine.connect() as conn:
+        try:
+            conn.execute("TRUNCATE TABLE popular_in_category;")
+
+            orders = pd.read_sql_query("""
+                SELECT *
+                FROM orders_prepared
+                WHERE order_date >= CURRENT_DATE - INTERVAL '1 MONTH'
+                AND order_date < CURRENT_DATE;
+            """, conn)
+
+            consultant = pd.read_sql_table("consultant_prepared", conn)
+
+            def get_top_items_for_categories_and_consultants(consultant, orders):
+                top_items_in_category_and_consultant = []
+
+                grouped_consultant = consultant.groupby(['gender', 'age_id', 'geozone_id', 'selfscore_id'])
+
+                for category, group in grouped_consultant:
+                    gender, age, geozone, selfscore = category
+
+                    for consultant_id in group['consultant_id']:
+                        filtered_orders = orders[orders['consultant_id'] == consultant_id]
+
+                        item_counts = filtered_orders['goods_id'].value_counts()
+
+                        top_items = item_counts.head(20).index.tolist()
+
+                        for item in top_items:
+                            top_items_in_category_and_consultant.append({
+                                'gender': gender,
+                                'age_id': age,
+                                'geozone_id': geozone,
+                                'selfscore_id': selfscore,
+                                'consultant_id': consultant_id,
+                                'item_id': item
+                            })
+
+                result_df = pd.DataFrame(top_items_in_category_and_consultant)
+
+                return result_df
+
+            popular_in_category_and_consultant = get_top_items_for_categories_and_consultants(consultant, orders)
+
+            data_dicts = [dict(zip(['gender', 'age_id', 'geozone_id', 'selfscore_id', 'consultant_id', 'item_id'], row)) for
+                          row in popular_in_category_and_consultant.to_numpy()]
+
+            sql = """
+                INSERT INTO popular_in_category (gender, age_id, geozone_id, selfscore_id, consultant_id, item_id)
+                VALUES (%(gender)s, %(age_id)s, %(geozone_id)s, %(selfscore_id)s, %(consultant_id)s, %(item_id)s)
+                ON CONFLICT (consultant_id, item_id)
+                DO NOTHING;
+                """
+
+            conn.execute(sql, data_dicts)
