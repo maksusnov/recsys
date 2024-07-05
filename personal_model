@@ -1,3 +1,10 @@
+import pandas as pd
+from sqlalchemy import create_engine
+from implicit.nearest_neighbours import TFIDFRecommender
+from rectools import Columns
+from rectools.dataset import Dataset
+from rectools.models import ImplicitItemKNNWrapperModel
+
 def personal_model():
     engine = get_sqlalchemy_engine()
     with engine.connect() as conn:
