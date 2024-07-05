@@ -1,0 +1,33 @@
+def personal_model():
+    engine = get_sqlalchemy_engine()
+    with engine.connect() as conn:
+        try:
+            conn.execute("TRUNCATE TABLE personal_rec;")
+
+            ratings = pd.read_sql_query("""
+                SELECT 
+                    consultant_id,
+                    order_date,
+                    goods_id,
+                    weight
+                FROM orders_prepared
+                WHERE order_date >= CURRENT_DATE - INTERVAL '1 MONTH'
+                AND order_date < CURRENT_DATE;
+            """, conn)
+
+            ratings.rename(columns={'consultant_id': 'user_id'}, inplace=True)
+            ratings.rename(columns={'order_date': 'datetime'}, inplace=True)
+            ratings.rename(columns={'goods_id': 'item_id'}, inplace=True)
+            ratings.rename(columns={'weight': 'weight'}, inplace=True)
+
+            dataset = Dataset.construct(ratings)
+            model = ImplicitItemKNNWrapperModel(TFIDFRecommender(K=5))
+            model.fit(dataset)
+            recos = model.recommend(
+                users=ratings[Columns.User].unique(),
+                dataset=dataset,
+                k=20,
+                filter_viewed=True,
+            )
+
+            recos.to_sql('personal_rec', conn, if_exists='append', index=False)
